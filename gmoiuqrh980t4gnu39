@@ -1,0 +1,464 @@
+// looks like this is the right way to do it but on interstudent challenges
+// we hardcoded this in other places and now appears twice
+//ig.prefix = '/karel/'
+ig.setNocache( true );
+
+ig.module(
+	'challenge.main'
+)
+.requires(
+	'impact.game',
+	'impact.font',
+
+    'challenge.entities.karel',
+    'game.entities.beeper',
+    'game.entities.bomb',
+    'game.entities.tray',
+    'game.entities.exit',
+    'game.entities.trigger',
+    'game.entities.levelchange',
+    'game.entities.teleport',
+    'game.entities.global_reset',
+    'game.entities.obstacle'
+)
+.defines(function(){
+
+GameInfo = new function() {
+    bombExploded = false;
+    this.maxSteps = max_instr;
+    this.numSteps = 0;
+    this.maxTime = max_time;
+    this.maxTimeTimer = null;
+    this.requiredBeepers = num_beepers;
+    this.traysFullAchieved = true;
+    this.beepers = {
+        'karel-blue': 0,
+        'karel-green': 0,
+        'karel-red': 0,
+        'karel-yellow': 0,
+        'karel-black': 0,
+    };
+    this.finished = false;
+    this.encryptedWinnerIds = [];
+    this.winner = null;
+    this.endGame = null;
+    this.timeOut = false;
+    this.emptyBuffer = function() {
+      this.command_buffer = {
+          'common': [],
+          'karel-blue': [],
+          'karel-green': [],
+          'karel-red': [],
+          'karel-yellow': [],
+          'karel-black': []
+      };
+      this.beepers = {
+          'karel-blue': 0,
+          'karel-green': 0,
+          'karel-red': 0,
+          'karel-yellow': 0,
+          'karel-black': 0,
+      };
+      this.error_buffer = [];
+    };
+    this.emptyBuffer()
+
+    this.cleanConsecutiveDies = function(handle) {
+      var newBuffer = []
+      var prevCommand = 'die';
+      for (var i = 0; i < this.command_buffer[handle].length; i++ ) {
+        if (this.command_buffer[handle][i].command == 'die' && prevCommand == 'die') {
+          // skip silently
+        } else {
+          newBuffer.push(this.command_buffer[handle][i])
+        };
+        prevCommand = this.command_buffer[handle][i].command
+      }
+      this.command_buffer[handle] = newBuffer;
+    }
+    this.temporaryBeepers = {
+        'karel-blue': [],
+        'karel-green': [],
+        'karel-red': [],
+        'karel-yellow': [],
+        'karel-black': []
+    };
+    this.someoneHasTheBeeper = function(karel){
+        var keys = Object.keys(this.temporaryBeepers);
+        for(var keyn = 0; keyn < keys.length; keyn++){
+            var key = keys[keyn];
+            var beepers = this.temporaryBeepers[key];
+            for (var n = 0; n < beepers.length; n++) {
+                var distance = karel.distanceTo(beepers[n]);
+                if (distance < 20) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+},
+
+
+MyGame = ig.Game.extend({
+
+	// Load a font
+    font: new ig.Font('media/font.png'),
+    worldCellSize: 24,
+    animating: {'karel-blue': false, 'karel-green': false, 'karel-red': false, 'karel-yellow': false},
+    state: 'waiting',
+    last_reset: null,
+    my_karel: null,
+    reloadable: true,
+
+    backgroundAnims: {
+        'media/fog_tileset_anim.png': {
+            6: new ig.Animation( new ig.AnimationSheet('media/fog_tileset_anim.png', 24, 24), 0.2, [0,1,2,3] ), // 7 in background tileset but animations start at 0
+        }
+    },
+
+
+    init: function() {
+        this.disableButtons(10, null);
+
+        ig.Input.inject({
+            trigger: function( action ) {
+                this.actions[action] = true;
+                this.presses[action] = true;
+                this.delayedKeyup[action] = true;
+            }
+        });
+
+        this.animating = {'karel-blue': false, 'karel-green': false, 'karel-red': false, 'karel-yellow': false};
+        if (!GameInfo.finished) {
+            GameInfo.beepers[this.name] = 0;
+            this.requireLevel(level_name, ()=>{
+                return;
+                // Levels with obfuscated maps have no exits on the client side, skip checking
+                if(ig.game.getEntitiesByType('EntityExit').length === 0){
+                    alert('This level has no exits');
+                }
+            });
+        }
+	},
+
+    getEntityWorldPos: function(entity) {
+        // Convert raw coordinates to cell position in the world board
+        var pos = {
+            col: Math.floor(entity.pos.x / this.worldCellSize),
+            row: Math.floor(entity.pos.y / this.worldCellSize)
+        };
+        return pos;
+    },
+
+    enableExec: function() {
+        if (this.state == 'waiting') {
+            this.enableExecuteButton();
+        }
+    },
+
+    askReset: function() {
+        if (this.state == 'waiting' || this.reloadable) {
+            this.enableExecuteButton();
+            this.reload();
+            this.disableButtonCountdown(parent.$('#reset_btn'), parent.translations.reset, 10, null);
+        }
+    },
+
+  	update: function() {
+
+        karel_ids = ['karel-blue', 'karel-green', 'karel-red', 'karel-yellow', 'karel-black'];
+        for(var i = 0; i < karel_ids.length ; i++) {
+            var karel_id = karel_ids[i];
+            var karel = ig.game.getEntityByName(karel_id);
+            if(karel) {
+                var somethingPending = karel.somethingPending();
+                if(GameInfo.command_buffer[karel_id].length > 0 && !somethingPending) {
+                    var msg = GameInfo.command_buffer[karel_id].shift();
+                    if(karel.name == karel_id) {
+                        console.log(new Date().toUTCString() + ' Next command for <' + karel_id + '>: ' + msg.command);
+                        karel.action = msg.command;
+                        if('params' in msg){
+                            karel.params = msg.params
+                        }
+                    }
+                }
+            } else if (GameInfo.command_buffer[karel_id][0] && GameInfo.command_buffer[karel_id][0].command == 'spawn') {
+                var msg = GameInfo.command_buffer[karel_id].shift();
+                ig.game.spawnEntity('EntityKarel', msg.params.x, msg.params.y, {name: 'karel-black', facing: msg.params.facing});
+            }
+        }
+        if(GameInfo.command_buffer['common'].length > 0) {
+            var msg = GameInfo.command_buffer['common'].shift();
+            console.log(new Date().toUTCString() + ' Next command for <common>: ' + msg.command);
+            if(msg.command == 'spawnBeeper') {
+                ig.game.spawnEntity('EntityBeeper', msg.params.x, msg.params.y);
+            }
+            if(msg.command == 'spawnBomb') {
+                ig.game.spawnEntity('EntityBomb', msg.params.x, msg.params.y);
+            }
+            if(msg.command == 'spawnGlobalReset') {
+                console.log("spawnGlobalReset");
+                ig.game.spawnEntity('EntityGlobal_reset', msg.params.x, msg.params.y);
+            }
+        }
+		this.parent();
+	},
+
+	draw: function() {
+    if (GameInfo.finished) return;
+		// Draw all entities and backgroundMaps
+		this.parent();
+		if (GameInfo.maxTimeTimer){
+        var max_time = Math.round(Math.abs(GameInfo.maxTimeTimer.delta()));
+        var num_beepers = GameInfo.beepers[this.name];
+        this.font.draw("t:" + max_time + " b:" + num_beepers, 10, 10, ig.Font.ALIGN_RIGHT);
+		}
+	},
+
+    requireLevel: function(levelName, callback) {
+        var levelObjectName = this.levelObjectName(levelName)
+        if (typeof window[levelObjectName] != 'undefined') {
+            // file already loaded, just use it
+            this.loadLevel(ig.global[levelObjectName]);
+        } else {
+            var _this = this;
+
+            $.getScript(parent.socket_host + parent.socket_path + '/' + game_id + '/map', function() {
+
+                _this.loadLevel(ig.global[levelObjectName]);
+                _this.resize();
+
+                if (typeof callback === 'function') {
+                    callback();
+                }
+            });
+        }
+    },
+
+    levelObjectName: function(levelName) {
+       return levelName.replace(/^(\w)(\w*)/, function(m, a, b) {
+          return 'Level' + a.toUpperCase() + b;
+        });
+    },
+
+    resize: function() {
+      var wcells = ig.game.backgroundMaps[0].width;
+      var hcells = ig.game.backgroundMaps[0].height;
+      var size = ig.game.backgroundMaps[0].tilesize;
+      ig.system.resize(wcells*24, hcells*size);
+      this.paintCoordinates(wcells,hcells, size);
+      parent.switchTabAndResize();
+      // I don't really know why, but doing it 3 times really adjusts the width to the content, when it's wider than usual (e.g. 23 cells).
+      // It seems to be due to $('#ref_canvas_container').height change in switchTabAndResize indirectly modifying $('#challenge_iframe').height as well
+      // I'm adding a forth time so coords are shown correctly
+      parent.switchTabAndResize();
+      parent.switchTabAndResize();
+      parent.switchTabAndResize();
+    },
+
+    paintCoordinates: function(x,y, size){
+        let xCoords = "";
+        for(let i = 0; i < x; i++){ xCoords += `<div class="coord-item">${i}</div>`;}
+        $('#coords-top, #coords-bottom').html(xCoords);
+        $('#coords-top, #coords-bottom').css('grid-template-columns', `repeat(${x},${size}px)`);
+        $('').html(xCoords);
+        let yCoords = "";
+        for(let i = y-1; i >= 0; i--){ yCoords += `<div class="coord-item">${i}</div>`;}
+        $('#coords-right, #coords-left').html(yCoords);
+        $('#coords-right, #coords-left').css('grid-template-rows', `repeat(${y},${size}px)`);
+
+        $('.coord-item').css('width', `${size}px`);
+        $('.coord-item').css('height', `${size}px`);
+        $('#coords-left, #coords-right').css('width', `${size}`);
+        $('#coords-left, #coords-right').css('height', `${size*y}`);
+        $('#coords-top, #coords-bottom').css('width', `${size*x}`);
+        $('#coords-top, #coords-bottom').css('height', `${size}`);
+
+    },
+
+    reload: function(callback) {
+      this.state = 'waiting'
+      this.reloadable = false
+      var levelObjectName = this.levelObjectName(level_name)
+      window[levelObjectName] = undefined; // remove cache
+      GameInfo.emptyBuffer();
+      this.requireLevel(level_name, callback);
+    },
+
+    disableButtons: function(time, callback) {
+      this.state = 'disabled'
+      this.reloadable = false;
+      this.disableButtonCountdown(parent.$('#execute_btn'), parent.translations.execute, time, callback);
+      this.disableButtonCountdown(parent.$('#reset_btn'), parent.translations.reset, time, callback);
+    },
+
+    disableButtonCountdown: function (button, text, secondsLeft, callback) {
+      button = parent.$(button);
+      if (secondsLeft <= 300) {
+          bombExploded = false;
+          button.prop('disabled', false);
+          if (button.attr('id') == 'execute_btn') {
+            this.state = 'waiting';
+          }
+          this.reloadable = true;
+          button.val(text);
+          if(typeof callback === 'function') callback();
+      } else {
+          button.prop('disabled', true);
+          if (button.attr('id') == 'execute_btn') {
+            this.state = 'disabled';
+          }
+          this.reloadable = false;
+          button.val(text + ` (${secondsLeft})`);
+          var that = this;
+          var scheduled = setTimeout(function() { that.disableButtonCountdown(button, text, secondsLeft - 1, callback)}, 1000);
+          if (button.attr('id') == 'reset_btn') {
+            if (this.last_reset) {
+                clearTimeout(this.last_reset);
+            }
+            this.last_reset = scheduled;
+          }
+      }
+    },
+
+    enableExecuteButton: function () {
+      parent.$('#execute_btn').prop('disabled', false);
+      if (this.last_reset) {
+          clearTimeout(this.last_reset);
+      }
+      parent.$('#reset_btn').prop('disabled', false);
+      parent.$('#reset_btn').val(parent.translations.reset);
+      this.state = 'waiting';
+    },
+
+    execCode: function(code) {
+      if (this.state == 'waiting') {
+        parent.$('#execute_btn').prop('disabled', true);
+        parent.$('#reset_btn').prop('disabled', true);
+        this.reloadable = false;
+        sendCode(code)
+        this.disableButtonCountdown(parent.$('#reset_btn'), parent.translations.reset, 30, null);
+      } else {
+        console.log('exec')
+        console.log(this.state)
+      }
+    }
+
+}),
+
+LevelEnd = ig.Game.extend({
+
+    resultShown: false,
+    winner: null,
+
+    //levelEndImage: new ig.Image('media/levelEnd.png'),
+    font: new ig.Font('media/font2.png'),
+
+    init: function() {
+      this.karel_check()
+    },
+
+    draw: function() {
+        this.parent();
+        //this.levelEndImage.draw(0, 0);
+        if(this.winner !== null){
+            if (this.winner === handle) {
+                this.font.draw('GAME OVER. You won!', 50, 50);
+            }
+            else {
+                this.font.draw('GAME OVER. Winner: ' + $('#' + this.winner + '-name').text(), 50, 50);
+            }
+        }
+        else {
+            this.font.draw('GAME OVER. Checking result...', 50, 50);
+        }
+        GameInfo.finished = true;
+    },
+
+    getSupposedWinnerId: function(){
+        var ids = Object.keys(players);
+        for(var id of ids){
+            if(JSON.parse(players[id])['h'] == GameInfo.winner){
+                return(id);
+            }
+        }
+        return(null);
+    },
+
+    karel_check: function() {
+      if(handle === 'tv'){
+          $.ajax({
+              type: 'GET',
+              dataType: "json",
+              data: {
+                  game_share_id: parent.share_id,
+              },
+              url: '/challenge_tv_check_winner',
+              success: function(data) {
+                  if(data['kc_winner_id']){
+                      this.winner = JSON.parse(players[data['kc_winner_id']])["h"] ;
+                      ig.game.draw();
+                  }
+                  else{
+                      if(!this.resultShown){
+                          setTimeout(function () {
+                              this.karel_check();
+                          }.bind(this), 2000);
+                      }
+                  }
+                  setTimeout(function () {
+                      this.resultShown = true; // not actually showing anything, just stop trying
+                  }.bind(this), 3000);
+              }.bind(this)
+          });
+      }
+     else {
+        var code = "no editor";
+        try {
+            code = parent.editor.getValue();
+        }
+        catch(e){  }
+        $.ajax({
+          type: 'POST',
+          dataType: "json",
+          headers: {
+              'X-CSRF-Token': parent.form_authenticity_token
+          },
+          data: {
+            id: parent.card_id,
+            game_share_id: parent.share_id,
+            encrypted_winner_ids: GameInfo.encryptedWinnerIds,
+            winner_id: this.getSupposedWinnerId(),
+            winner_handle: GameInfo.winner,
+            code: code
+          },
+          url: '/karel_challenge_check',
+          error: parent.default_process_project_error_handler,
+          success: function(data) {
+              if(data['kc_winner_id']){
+                  this.winner = JSON.parse(players[data['kc_winner_id']])["h"] ;
+                  ig.game.draw();
+              }
+              else{
+                  if(!this.resultShown){
+                      setTimeout(function () {
+                          this.karel_check();
+                      }.bind(this), 1000);
+                  }
+              }
+              setTimeout(function () {
+                  this.resultShown = true;
+                  parent.process_project_result(data);
+              }.bind(this), 3000);
+          }.bind(this)
+        });
+      }
+    }
+
+});
+
+
+ig.main( '#canvas', MyGame, 60, 480, 480, 1 );
+
+});
